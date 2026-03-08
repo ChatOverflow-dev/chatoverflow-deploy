@@ -5,10 +5,28 @@ From: python:3.13-slim
     Author ChatOverflow-dev
     Description ChatOverflow all-in-one: DB + API + MCP + Frontend
 
+%files
+    api-for-agents /opt/api-for-agents
+    chatoverflow-mcp /opt/chatoverflow-mcp
+    frontend-for-humans /opt/frontend-for-humans
+    supabase/docker-entrypoint-initdb.d /docker-entrypoint-initdb.d
+    # Uncomment to inject a custom CA certificate (e.g. corporate proxy):
+    # my-ca.crt /opt/custom-ca.crt
+
 %post
+    # Fix PATH for fakeroot builds (dpkg needs sbin directories)
+    export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+    # Uncomment to install a custom CA certificate:
+    # cp /opt/custom-ca.crt /usr/local/share/ca-certificates/custom-ca.crt
+    # update-ca-certificates
+    # export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+    # export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+    # export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
     apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates git supervisor nginx \
-        gnupg lsb-release \
+        gnupg lsb-release xz-utils \
         && rm -rf /var/lib/apt/lists/*
 
     # Install Node.js 20.x
@@ -30,40 +48,36 @@ From: python:3.13-slim
         | tar -xJf - -C /usr/local/bin
     chmod +x /usr/local/bin/postgrest
 
-    # Clone repos at build time
-    git clone --depth 1 https://github.com/ChatOverflow-dev/api-for-agents.git   /opt/api-for-agents
-    git clone --depth 1 https://github.com/ChatOverflow-dev/chatoverflow-mcp.git  /opt/chatoverflow-mcp
-    git clone --depth 1 https://github.com/ChatOverflow-dev/frontend-for-humans.git /opt/frontend-for-humans
+    # Source code already copied via %files — no git clone needed
 
     # Install Python deps
     pip install --no-cache-dir -r /opt/api-for-agents/requirements.txt
     pip install --no-cache-dir -r /opt/chatoverflow-mcp/requirements.txt
 
-    # Build frontend
-    cd /opt/frontend-for-humans && npm ci && npm run build
+    # Build frontend (install native SWC for Turbopack support)
+    # NEXT_PUBLIC_API_URL is baked at build time into the rewrite rules
+    cd /opt/frontend-for-humans && npm ci && npm install @next/swc-linux-x64-gnu \
+        && NEXT_PUBLIC_API_URL=http://localhost:5000 npm run build
 
-    # Create directories
-    mkdir -p /var/log /run/postgresql /var/lib/postgresql/data /config
-    chown -R postgres:postgres /run/postgresql /var/lib/postgresql
+    # Create directories with open permissions (Singularity runs as current user)
+    mkdir -p /var/log/chatoverflow /run/postgresql /var/lib/postgresql/data /config
+    chmod 777 /var/log/chatoverflow /run/postgresql /var/lib/postgresql /var/lib/postgresql/data
 
-    # Copy SQL init scripts
-    mkdir -p /opt/sql-init
-    cp /opt/api-for-agents/schema.sql /opt/sql-init/ 2>/dev/null || true
-
-    # PostgREST config
+    # PostgREST config — port 3100 to avoid conflict with frontend
     cat > /etc/postgrest.conf << 'PGRST'
-db-uri = "postgres://postgres:postgres@localhost:5432/chatoverflow"
+db-uri = "postgres://localhost:5433/chatoverflow"
 db-schemas = "public"
 db-anon-role = "anon"
 jwt-secret = "super-secret-jwt-token-with-at-least-32-characters-long"
+server-port = 3100
 PGRST
 
-    # Nginx gateway config (routes /rest/v1/* to PostgREST)
+    # Nginx gateway config (routes /rest/v1/* to PostgREST on 3100)
     cat > /etc/nginx/sites-available/default << 'NGINX'
 server {
-    listen 8000;
+    listen 18000;
     location /rest/v1/ {
-        proxy_pass http://127.0.0.1:3000/;
+        proxy_pass http://127.0.0.1:3100/;
         proxy_pass_request_headers on;
     }
     location /health {
@@ -72,23 +86,25 @@ server {
 }
 NGINX
 
-    # Supervisor config
+    # Make nginx writable dirs accessible to non-root
+    mkdir -p /var/lib/nginx/body /var/lib/nginx/proxy /var/lib/nginx/fastcgi
+    chmod -R 777 /var/log/nginx /var/lib/nginx /run
+
+    # Supervisor config — no user= directives, use log files (not /dev/stdout)
+    # These changes are required for Singularity (non-root, no /dev/stdout)
     mkdir -p /etc/supervisor/conf.d
     cat > /etc/supervisor/conf.d/chatoverflow.conf << 'EOF'
 [supervisord]
 nodaemon=true
-logfile=/var/log/supervisord.log
+logfile=/var/log/chatoverflow/supervisord.log
 
 [program:postgres]
-command=/usr/lib/postgresql/17/bin/postgres -D /var/lib/postgresql/data -c listen_addresses=127.0.0.1
-user=postgres
+command=/usr/lib/postgresql/17/bin/postgres -D %(ENV_PGDATA)s -c listen_addresses=127.0.0.1 -p 5433
 autostart=true
 autorestart=true
 priority=10
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stderr
-stderr_logfile_maxbytes=0
+stdout_logfile=/var/log/chatoverflow/postgres.log
+stderr_logfile=/var/log/chatoverflow/postgres_err.log
 
 [program:postgrest]
 command=/usr/local/bin/postgrest /etc/postgrest.conf
@@ -96,101 +112,102 @@ autostart=true
 autorestart=true
 priority=20
 startsecs=5
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stderr
-stderr_logfile_maxbytes=0
+stdout_logfile=/var/log/chatoverflow/postgrest.log
+stderr_logfile=/var/log/chatoverflow/postgrest_err.log
 
 [program:nginx]
 command=nginx -g "daemon off;"
 autostart=true
 autorestart=true
 priority=20
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stderr
-stderr_logfile_maxbytes=0
+stdout_logfile=/var/log/chatoverflow/nginx.log
+stderr_logfile=/var/log/chatoverflow/nginx_err.log
 
 [program:api]
-command=uvicorn app.main:app --host 0.0.0.0 --port 7777
+command=uvicorn app.main:app --host 0.0.0.0 --port 5000
 directory=/opt/api-for-agents
 autostart=true
 autorestart=true
 priority=30
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stderr
-stderr_logfile_maxbytes=0
+stdout_logfile=/var/log/chatoverflow/api.log
+stderr_logfile=/var/log/chatoverflow/api_err.log
 
 [program:mcp]
 command=python server.py
 directory=/opt/chatoverflow-mcp
+environment=PORT=4100
 autostart=true
 autorestart=true
 priority=30
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stderr
-stderr_logfile_maxbytes=0
+stdout_logfile=/var/log/chatoverflow/mcp.log
+stderr_logfile=/var/log/chatoverflow/mcp_err.log
 
 [program:frontend]
-command=npx next start --port 3000
+command=npx next start --port 4000
 directory=/opt/frontend-for-humans
 autostart=true
 autorestart=true
 priority=30
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stderr
-stderr_logfile_maxbytes=0
+stdout_logfile=/var/log/chatoverflow/frontend.log
+stderr_logfile=/var/log/chatoverflow/frontend_err.log
 EOF
 
 %environment
     export PATH=/usr/local/bin:/usr/lib/postgresql/17/bin:$PATH
     export PGDATA=/var/lib/postgresql/data
+    export PGPORT=5433
 
-%startscript
+%runscript
+    # In Singularity we run as the current user (not root), so no su needed.
+    # PostgreSQL runs as the current user directly.
+
+    PGDATA="${PGDATA:-/var/lib/postgresql/data}"
+
     # Initialize PostgreSQL if needed
     if [ ! -f "$PGDATA/PG_VERSION" ]; then
-        su - postgres -c "/usr/lib/postgresql/17/bin/initdb -D $PGDATA"
-        su - postgres -c "/usr/lib/postgresql/17/bin/pg_ctl -D $PGDATA start -w"
-        su - postgres -c "psql -c \"ALTER USER postgres PASSWORD 'postgres';\""
-        su - postgres -c "psql -c 'CREATE DATABASE chatoverflow;'"
-        su - postgres -c "psql -d chatoverflow -c 'CREATE SCHEMA IF NOT EXISTS extensions;'"
-        su - postgres -c "psql -d chatoverflow -c 'CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\" WITH SCHEMA extensions;'"
-        su - postgres -c "psql -d chatoverflow -c 'CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions;'"
-        # Run init SQL files
+        echo "Initializing PostgreSQL..."
+        /usr/lib/postgresql/17/bin/initdb -D "$PGDATA"
+
+        # Configure pg_hba.conf for trust auth on localhost (safe for single-user container)
+        cat > "$PGDATA/pg_hba.conf" << 'HBA'
+local   all   all                 trust
+host    all   all   127.0.0.1/32  trust
+host    all   all   ::1/128       trust
+HBA
+
+        # Start PostgreSQL temporarily for schema init
+        /usr/lib/postgresql/17/bin/pg_ctl -D "$PGDATA" -o "-p 5433" start -w
+
+        # Create database and roles
+        psql -p 5433 -c "CREATE DATABASE chatoverflow;" 2>/dev/null || true
+        psql -p 5433 -d chatoverflow -c "CREATE SCHEMA IF NOT EXISTS extensions;"
+
+        # Create roles used by PostgREST and the SQL init scripts
+        psql -p 5433 -d chatoverflow -c "DO \$\$ BEGIN CREATE ROLE anon NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END \$\$;"
+        psql -p 5433 -d chatoverflow -c "DO \$\$ BEGIN CREATE ROLE authenticated NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END \$\$;"
+        psql -p 5433 -d chatoverflow -c "DO \$\$ BEGIN CREATE ROLE service_role NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END \$\$;"
+        psql -p 5433 -d chatoverflow -c "GRANT anon, authenticated, service_role TO CURRENT_USER;"
+
+        # Create extensions
+        psql -p 5433 -d chatoverflow -c 'CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA extensions;'
+        psql -p 5433 -d chatoverflow -c 'CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions;'
+
+        # Grant permissions
+        psql -p 5433 -d chatoverflow -c "GRANT ALL ON SCHEMA public TO anon, authenticated, service_role;"
+        psql -p 5433 -d chatoverflow -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated, service_role;"
+        psql -p 5433 -d chatoverflow -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO anon, authenticated, service_role;"
+        psql -p 5433 -d chatoverflow -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated, service_role;"
+
+        # Run init SQL files (tables, functions, etc.)
         for f in /docker-entrypoint-initdb.d/*.sql; do
-            [ -f "$f" ] && su - postgres -c "psql -d chatoverflow -f $f"
+            [ -f "$f" ] && echo "Running $f ..." && psql -p 5433 -d chatoverflow -f "$f"
         done
-        su - postgres -c "/usr/lib/postgresql/17/bin/pg_ctl -D $PGDATA stop -w"
+
+        /usr/lib/postgresql/17/bin/pg_ctl -D "$PGDATA" stop -w
+        echo "PostgreSQL initialized."
     fi
 
     # Source env files from bind-mounted /config if present
-    for f in /config/api.env /config/mcp.env /config/frontend.env; do
-        if [ -f "$f" ]; then
-            set -a; . "$f"; set +a
-        fi
-    done
-
-    exec supervisord -c /etc/supervisor/conf.d/chatoverflow.conf
-
-%runscript
-    # Same as startscript
-    if [ ! -f "$PGDATA/PG_VERSION" ]; then
-        su - postgres -c "/usr/lib/postgresql/17/bin/initdb -D $PGDATA"
-        su - postgres -c "/usr/lib/postgresql/17/bin/pg_ctl -D $PGDATA start -w"
-        su - postgres -c "psql -c \"ALTER USER postgres PASSWORD 'postgres';\""
-        su - postgres -c "psql -c 'CREATE DATABASE chatoverflow;'"
-        su - postgres -c "psql -d chatoverflow -c 'CREATE SCHEMA IF NOT EXISTS extensions;'"
-        su - postgres -c "psql -d chatoverflow -c 'CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\" WITH SCHEMA extensions;'"
-        su - postgres -c "psql -d chatoverflow -c 'CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions;'"
-        for f in /docker-entrypoint-initdb.d/*.sql; do
-            [ -f "$f" ] && su - postgres -c "psql -d chatoverflow -f $f"
-        done
-        su - postgres -c "/usr/lib/postgresql/17/bin/pg_ctl -D $PGDATA stop -w"
-    fi
-
     for f in /config/api.env /config/mcp.env /config/frontend.env; do
         if [ -f "$f" ]; then
             set -a; . "$f"; set +a
