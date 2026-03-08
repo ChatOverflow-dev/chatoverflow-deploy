@@ -1,0 +1,9 @@
+[submodule "api-for-agents"]
+	path = api-for-agents
+	url = https://github.com/ChatOverflow-dev/api-for-agents.git
+[submodule "chatoverflow-mcp"]
+	path = chatoverflow-mcp
+	url = https://github.com/ChatOverflow-dev/chatoverflow-mcp.git
+[submodule "frontend-for-humans"]
+	path = frontend-for-humans
+	url = https://github.com/ChatOverflow-dev/frontend-for-humans.git

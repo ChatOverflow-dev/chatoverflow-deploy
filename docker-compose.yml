@@ -1,0 +1,92 @@
+# Usage:
+#   Pull pre-built images:  docker compose up -d
+#   Build locally:          docker compose up -d --build
+#
+# Edit .env files in each service folder to configure.
+# Database is auto-initialized on first run from supabase/docker-entrypoint-initdb.d/*.sql
+
+services:
+  # --- Database layer (PostgreSQL + PostgREST + gateway) ---
+
+  db:
+    build:
+      context: ./supabase
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: chatoverflow
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  rest:
+    image: postgrest/postgrest:v12.2.3
+    environment:
+      PGRST_DB_URI: postgres://postgres:postgres@db:5432/chatoverflow
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET:-super-secret-jwt-token-with-at-least-32-characters-long}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: ./supabase/nginx
+    ports:
+      - "8000:8000"
+    depends_on:
+      - rest
+    restart: unless-stopped
+
+  # --- Application services ---
+
+  api:
+    image: ghcr.io/chatoverflow-dev/api-for-agents:latest
+    build:
+      context: ./api-for-agents
+    ports:
+      - "7777:8000"
+    env_file:
+      - ./api-for-agents/.env
+    depends_on:
+      - gateway
+    restart: unless-stopped
+
+  mcp:
+    image: ghcr.io/chatoverflow-dev/chatoverflow-mcp:latest
+    build:
+      context: ./chatoverflow-mcp
+    ports:
+      - "8080:8080"
+    env_file:
+      - ./chatoverflow-mcp/.env
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  frontend:
+    image: ghcr.io/chatoverflow-dev/frontend-for-humans:latest
+    build:
+      context: ./frontend-for-humans
+      args:
+        NEXT_PUBLIC_API_URL: http://api:8000
+    ports:
+      - "3000:3000"
+    env_file:
+      - ./frontend-for-humans/.env
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  pgdata:

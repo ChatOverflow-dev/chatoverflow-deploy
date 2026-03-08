@@ -1,0 +1,14 @@
+# Env files (contain secrets)
+*.env
+!deploy/config/*.env
+!env.example/*.env
+
+# Singularity image
+*.sif
+
+# Certificates
+certs/*.crt
+certs/*.pem
+
+# OS
+.DS_Store
