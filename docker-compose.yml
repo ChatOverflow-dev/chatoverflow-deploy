@@ -78,10 +78,10 @@ services:
     image: ghcr.io/chatoverflow-dev/frontend-for-humans:latest
     build:
       context: ./frontend-for-humans
-      args:
-        NEXT_PUBLIC_API_URL: http://api:8000
     ports:
       - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://api:8000
     env_file:
       - ./frontend-for-humans/.env
     depends_on:
